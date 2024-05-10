@@ -1,0 +1,594 @@
+#!/bin/bash
+##
+## jamf-migrate-to-user-enrolled
+##
+## migrate Macs by downloading an MDM Profile via an enrollment invite
+## Mac can be user or prestage enrolled
+## end result will be a user-enrolled Mac
+##
+## 1. add a policy to run the script
+## 2. add parameter for destination server no-login invite ID (last part of the URL, or listed in Enrollment Invitations)
+## 3. add parameter for destination server name - eg destjamf.jamfcloud.com
+## 4. (optional) add parameter for source server URL
+## 5. (optional) add parameter for source server api auth
+##
+## Scope to Macs with "Enrolled via Automated Device Enrollment = No" if not using source api
+## Add to Self Service or trigger at check-in as desired
+##
+## The user must approve the new MDM Profile
+## They will be prompted with a popup dialog, granted admin rights temporarily, then Profiles will open.
+## The user clicks Install and can enter their normal username & password to approve the profile.
+##
+## You must create an enrollment invitation in the destination site
+## The invitation should NOT require login
+##
+## parameters
+## $4 enrollment invitation ID - this is the number at the end of
+##    the invitation URL. It is also visible in the Enrollment Invitations
+##    list in JAMF
+## $5 Destination Jamf server name - ie destjamf.jamfcloud.com
+##    The invite ID above must be from the specified server
+##
+## $6 (optional) Source server URL - https://yoursever.jamfcloud.com (do not include / or JSSResource)
+##    If Source url and apiauth provided, and jamf removemdmprofile files, will try using api
+## $7 (optional) Source server apiauth - base64 encoded or (not recommended) user:password
+##
+## v1.1 - fixed daemon cleanup, changed check for existing daemon, uses name of script, checks for sudo/root
+## v1.2 - added check for working connection to JSS
+## v1.3 - first 'migrate' version - adapted for running from jamf
+## v1.4 - changes to run from source jamf (remove mdm profile first)
+## v1.5 - function for getting mdm profile
+##        changed username parameter to jamf server
+##        check for MDM Profile instead of Jamf binary
+## v1.6 - added check of downloaded MDM Profile before removing existing MDM Profile
+##        changed text of dialog from 'enrolled' to 'migrated'
+##        added activate of System Preferences
+##        moved MDM Profile remove after dialog so blocked-extension messages don't cover it
+##        added wait for MDM Profile to be removed before proceeding
+## v1.7 loflindl 7/17/22  - added src api param + remove MDM via api, if found
+##                        - removed daemon setup code
+##                        - added activate of sys prefs to profile wait loop
+## v1.8 loflindl 7/18/22  - using only /tmp for .mobileconfig file to prevent disk access prompts
+## v1.9 loflindl 7/25/22  - switch to bearer auth instead of basic auth
+## v1.10 loflindl 8/28/22 - if source api provided, get assigned user, deptcode and write to inventory.plist
+##                        - get eid from inventory.plist instead of userinfo.plist
+##                        - remove running 'jamf policy' at end
+## v1.11 loflindl 9/26/22 - open prefs-profiles in the wait loop instead of just activate; option to not prompt;##
+## v1.12 loflindl 10/6/22 - add checking for & clearing pending mdm commands
+## v1.13 loflindl 1/12/23 - 900s timeout for api remove; 20s for jamf removemdmprofile
+## v1.14 loflindl 1/15/23 - timeouts at top of script; don't wait on Prefs; add more EAs
+## v1.15 loflindl 1/20/23 - change Dest jamf param to URL; new check_jss_url; download profile using url w/o adding https
+## v1.16 loflindl 1/21/23 - retry readding profile every N secs instead of 20; remove assigning username - prevents migration being logged
+## v1.17 loflindl 2/9/23  - re-prompt user when readding profile, timing out after 10 secs; changes to prompt message; logging
+## v1.18 loflindl 2/23/23 - add completion message at end
+#######################################################################################
+# Global timeouts
+
+# how long to wait for MDM removal after jamf removemdmprofile
+JAMF_WAIT_MDMREMOVEPROFILE=20
+
+# how long to wait for MDM removal after api remove  (needs to be long, can take many minutes)
+JAMF_WAIT_APIMDMREMOVE=900
+
+# how often to retry mdm install while waiting 
+JAMF_WAIT_RETRYMDMINSTALL=90
+
+# how long to wait for MDM to be added
+JAMF_WAIT_MDMADD=600
+
+##############################################
+
+mkdir -p /usr/local/migrate 2>/dev/null
+LOG=/usr/local/migrate/migrate.log
+rm -f $LOG
+touch $LOG
+
+INVENTORY_PLIST=/usr/local/migrate/inventory.plist
+
+DIALOG_TITLE="ORGANIZATION NAME"
+DIALOG_JAMF_DEST="the new Jamf server"
+DIALOG_ORG_NAME="Company"
+
+###############################################
+
+#(for debug) echo "Parameters: $0 $1 $2 $3 $4"
+
+script_name=$(basename "$0")
+echo Script is: $script_name
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: This script must run with sudo or as root"
+    errorMessage
+    exit 1
+fi
+
+function getApiAuth () {
+  # example: srcAuth=$(getApiAuth $7)
+  # decode from base64
+  # check if result has a ":" in it, not at end
+  # if it does not, check orig param - if no :, return empty
+
+  apiAuth=$(echo "$1" | openssl enc -base64 -d)
+  if ! echo "$apiAuth" | sed 's/.$//' | grep -q ":" ; then
+  # if no : in decoded string, try undecoded
+    apiAuth="$1"
+    if ! echo "$apiAuth" | sed 's/.$//' | grep -q ":" ; then
+    # if still no : set to empty
+      apiAuth=""
+    fi
+  fi
+  echo "$apiAuth"
+}
+
+function  check_jss_url() {
+  # Check for working connection to JSS. Exit if fail
+
+  MDM_URL="$1"
+  echo "`date`: Checking connection to $MDM_URL"
+  if command -v curl | grep -iq curl ; then
+    httpCode="$(curl -s -m 3 -o /dev/null -w '%{http_code}' "$MDM_URL")"
+    retval=$?
+    if [[ retval -eq 0 ]]; then
+      if [ "$httpCode" != "404" ] && [ "$httpCode" != "403" ]; then
+          echo "`date`: Connection to JSS successful."
+      else
+          echo "`date`: Error! Unable to connect to JSS. Aborting script."
+          errorMessage
+          exit 1
+      fi
+    else
+          echo "`date`: Error! Unable to connect to JSS. Aborting script."
+          errorMessage
+          exit 1
+    fi
+  else
+    # curl missing
+    echo "`date`: curl not installed. Aborting."
+    errorMessage
+    exit 1
+  fi
+}
+
+function errorMessage() {
+  errorMessage="JAMF Migration has failed, your Jamf admin should check the logs."
+  errorTimeout=60
+  osascript -e \
+  'display dialog "'"$errorMessage"'\n" buttons {"Ok"} default button "Ok" giving up after '"$errorTimeout"'' 2>/dev/null
+}
+
+
+INVITE="$4"
+srcJamfUrl="$6"
+if [ "$(echo $srcJamfUrl | grep "http")" == "" ]; then
+  srcJamfUrl="https://$srcJamfUrl"
+fi
+
+srcJamfApiAuth=$(getApiAuth "$7")
+# debug: echo "Using srcApiAuth: $srcJamfApiAuth"
+if [[ -z "$INVITE" ]]; then
+  echo "ERROR: no enrollment invitation ID provided, exiting"
+  errorMessage
+  exit 1
+fi
+
+noPrompt="$8"
+
+initialMessage="$DIALOG_TITLE
+
+JAMF Migration is starting..."
+
+if [ "$noPrompt" != "true" ]; then
+  initialTimeout=5
+  osascript -e \
+  'display dialog "'"$initialMessage"'\n" buttons {"Ok"} default button "Ok" giving up after '"$initialTimeout"'' 2>/dev/null &
+fi
+
+
+XPATH="xmllint --xpath"
+if [ "$srcJamfUrl" != "" ] && [ "$srcJamfApiAuth" != "" ]; then
+  check_jss_url $srcJamfUrl
+  srcAuthToken=$(curl -u "$srcJamfApiAuth" -s -X POST \
+    --header 'Accept: application/json' --url "${srcJamfUrl}/api/v1/auth/token" \
+    | plutil -convert xml1 - -o - | $XPATH "/plist/dict/string" - \
+    | awk -F'</?string>' '{for(i=1;i<=NF;i++) print $i}' | awk 'NF > 0' | tail -1)
+  #echo AuthToken: $srcAuthToken
+
+  mac_serial=`system_profiler SPHardwareDataType | awk '/Serial/ {print $4}'`
+
+  jamf_id=$(curl -sk "${srcJamfUrl}/JSSResource/computers/serialnumber/${mac_serial}" -X GET \
+   --header "Authorization: Bearer ${srcAuthToken}" \
+   | $XPATH "/computer/general/id/text()" - 2>/dev/null)
+  echo "Jamf ID: $jamf_id"
+
+  # code from ea-inventory-plist to create inventory.plist before migration so provisioning can make use of it
+  echo Getting General info for inventory.plist...
+  XML_GENERAL_DATA=$(curl -k -s --request GET \
+     --url "$srcJamfUrl/JSSResource/computers/serialnumber/${mac_serial}/subset/General" \
+     --header "Authorization: Bearer ${srcAuthToken}" \
+     --header 'Accept: application/xml')
+
+  echo Getting asset tag..
+  ASSET_TAG=$(echo "$XML_GENERAL_DATA" | $XPATH "//asset_tag/text()" -)
+  defaults write "$INVENTORY_PLIST" "Asset Tag" "$ASSET_TAG"
+
+  # get assigned user
+  echo Getting User and Location data...
+  XML_USERLOC_DATA=$(curl -k -s --request GET \
+     --url "$srcJamfUrl/JSSResource/computers/serialnumber/${mac_serial}/subset/Location" \
+     --header "Authorization: Bearer ${srcAuthToken}" \
+     --header 'Accept: application/xml')
+  echo Getting assigned user...
+  ASSIGNED_USER=$(echo "$XML_USERLOC_DATA" | $XPATH "//username/text()" -)
+  defaults write "$INVENTORY_PLIST" "Assigned User" "$ASSIGNED_USER"
+  echo Getting fullname...
+  ASSIGNED_USER_FULLNAME=$(echo "$XML_USERLOC_DATA" | $XPATH "//realname/text()" -)
+  defaults write "$INVENTORY_PLIST" "Assigned User Fullname" "$ASSIGNED_USER_FULLNAME"
+  echo Getting email...
+  ASSIGNED_USER_EMAIL=$(echo "$XML_USERLOC_DATA" | $XPATH "//email_address/text()" -)
+  defaults write "$INVENTORY_PLIST" "Assigned User Email" "$ASSIGNED_USER_EMAIL"
+
+  # get EA data
+  echo "Getting EA data..."
+  XML_EA_DATA=$(curl -k -s --request GET \
+     --url "$srcJamfUrl/JSSResource/computers/serialnumber/${mac_serial}/subset/ExtensionAttributes" \
+     --header "Authorization: Bearer ${srcAuthToken}" \
+     --header 'Accept: application/xml')
+     
+  function write-ea-to-inventory {
+    EA_NAME="$1"
+    echo "Getting EA data for $EA_NAME..."
+    xpath_query="//extension_attribute[name='"%s"']/value/text()"
+    xpath_query_parsed=$(printf "$xpath_query" "$EA_NAME")
+    EA_VALUE="$(echo "$XML_EA_DATA" | $XPATH "$xpath_query_parsed" - 2>/dev/null)"
+    if [ "$EA_VALUE" != "" ]; then
+      defaults write "$INVENTORY_PLIST" "$EA_NAME" "$EA_VALUE"
+    fi
+  }
+  
+  # add what EA's you wish to write to inventory.plist here
+
+  write-ea-to-inventory 'Department Code'
+  write-ea-to-inventory 'Designation'
+  write-ea-to-inventory 'Customer'
+  write-ea-to-inventory 'Identification'
+  write-ea-to-inventory 'Building Code'
+
+fi  # end if srcJamf api info provided
+
+
+# if inventory.plist exists, get User, Department Code for assigning user
+if [ -f "$INVENTORY_LIST" ]; then
+  echo "Getting User from inventory.plist.."
+  EID="$(defaults read "$INVENTORY_PLIST" 'Assigned User')"
+  echo "Using User: $EID"
+fi
+
+jamfServer="$5"
+if [[ "$jamfServer" == "" ]]; then
+  # set a default jamf server here
+  jamfServer=""
+fi
+if [ "$(echo $jamfServer | grep "http")" == "" ]; then
+  jamfServer="https://$jamfServer"
+fi
+echo "Migrating to Jamf server $jamfServer"
+
+HOST=$(scutil --get ComputerName)
+currentUser=$( echo "show State:/Users/ConsoleUser" | scutil | awk '/Name :/ { print $3 }' )
+
+######################################################################################
+# function to get MDM Profile
+# usage: get_mdm_profile myjamf.jamfcloud.com
+# expects $currentUser and $INVITE to be already set
+#
+# this code was derived via Chrome's Developer Tools and might need updating at some point
+
+
+function get_mdm_profile () {
+
+  jamfServer=$1
+  echo user: $currentUser >>$LOG
+  echo server: $jamfServer >>$LOG
+  echo invite: $INVITE >>$LOG
+  /usr/bin/curl "$jamfServer"'/enroll/?' \
+    -H 'authority: '"$jamfServer"'' \
+    -H 'cache-control: max-age=0' \
+    -H 'sec-ch-ua: " Not A;Brand";v="99", "Chromium";v="96", "Google Chrome";v="96"' \
+    -H 'sec-ch-ua-mobile: ?0' \
+    -H 'sec-ch-ua-platform: "macOS"' \
+    -H 'upgrade-insecure-requests: 1' \
+    -H 'origin: '"$jamfServer"'' \
+    -H 'content-type: application/x-www-form-urlencoded' \
+    -H 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36' \
+    -H 'accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9' \
+    -H 'sec-fetch-site: same-origin' \
+    -H 'sec-fetch-mode: navigate' \
+    -H 'sec-fetch-user: ?1' \
+    -H 'sec-fetch-dest: document' \
+    -H 'referer: '"$jamfServer"'/enroll/?' \
+    -H 'accept-language: en-US,en;q=0.9' \
+    -H 'cookie: _ga=GA1.1.1641720015.1632512756; _ga_X3HZEK54PC=GS1.1.1635861674.1.0.1635861782.60; JSESSIONID=YWQ4Mzk0MzEtODliZi00YzFjLWFhMWYtYjYwNzkzNTY5Mjk3; AWSALB=Ck4pGD1IbuyOQ+91Dd0c1os/seaZHkbgagBNLJQXdLHpWiRQvsxMojkBZLKY6zTzoYkQJEe8j8iFCs70uTxrf+l1tjchlLMv7wv7iMyRWI/DxGt7r2sydG60nVME; AWSALBCORS=Ck4pGD1IbuyOQ+91Dd0c1os/seaZHkbgagBNLJQXdLHpWiRQvsxMojkBZLKY6zTzoYkQJEe8j8iFCs70uTxrf+l1tjchlLMv7wv7iMyRWI/DxGt7r2sydG60nVME' \
+    --data-raw 'lastPage=installEnterpriseProfile.jsp&payload=enterprise&device-detect-complete=&invitation='"$INVITE"'&type=' \
+    --compressed -o /tmp/enrollmentProfile.mobileconfig
+} # end function
+######################################################################################
+
+mdmEnrolled=$(profiles status -type enrollment | fgrep "MDM enrollment" | awk '{print $3}')
+mdmServer=$(profiles status -type enrollment | fgrep "MDM server" | awk -F"/" '{print $3}')
+
+if [ "$mdmEnrolled" == "Yes" ]; then
+  if [ "$mdmServer" == "" ]; then
+    mdmServer="(not available)"
+  fi
+  echo "$HOST is enrolled in MDM, server $mdmServer"
+fi
+
+echo
+
+echo "`date`: Current console user: $currentUser"
+
+if [[ $currentUser != "" ]]; then
+  uid=$(id -u "$currentUser")
+fi
+echo UID=$uid
+
+check_jss_url $jamfServer
+
+echo "`date`: Getting enrollmentProfile.mobileconfig from $jamfServer for the invite ID"
+echo "Invite ID: $INVITE"
+echo
+
+# get the enrollment profile
+/bin/rm /tmp/enrollmentProfile.mobileconfig
+get_mdm_profile $jamfServer
+
+# check that file is valid MDM Profile
+fileCheck=$(cat -v /tmp/enrollmentProfile.mobileconfig | fgrep "<string>MDM Profile</string>")
+if [ "$fileCheck" != "" ]; then
+  echo "`date`: enrollmentProfile.mobileconfig appears valid, continuing"
+else
+  badFileInfo=$(fgrep "!DOCTYPE html PUBLIC" /tmp/enrollmentProfile.mobileconfig)
+  echo
+  echo "`date`: enrollmentProfile.mobileconfig is not valid, exiting.  Check enrollment invitation ID parameter"
+  echo "File shows: $badFileInfo"
+  errorMessage
+  exit 1
+fi
+
+#echo "Debug exit"
+#exit 0
+
+################## PROMPT USER ONLY IF noPrompt != true #########################
+if [ "$noPrompt" != "true" ]; then
+
+
+echo "`date`: "
+os_maj=$(sw_vers -productVersion | cut -f1 -d.)
+echo OS: $os_maj
+
+echo Waiting for user to click Continue
+echo ...
+
+if [ "$os_maj" -lt "13" ]; then
+migrateMessage="$DIALOG_TITLE
+
+Your computer is being migrated to $DIALOG_JAMF_DEST, the required management system for all $DIALOG_ORG_NAME-owned Macs.
+
+IMPORTANT: when System Preferences->Profiles opens, click the Install button for MDM Profile.
+
+Please click OK on any prompts about blocked extensions, they will be unblocked after migration is complete."
+
+else
+migrateMessage="$DIALOG_TITLE
+
+Your computer is being migrated to $DIALOG_JAMF_DEST, the required management system for all $DIALOG_ORG_NAME-owned Macs.
+
+IMPORTANT: when System Settings->Profiles opens, double-click on MDM Profile to install it.
+
+Please click OK on any prompts about blocked extensions, they will be unblocked after migration is complete."
+fi
+
+migrateTimeout=120
+osascript -e \
+'display dialog "'"$migrateMessage"'\n" buttons {"Ok"} default button "Ok" giving up after '"$migrateTimeout"'' 2>/dev/null
+
+
+
+fi ############### END PROMPT USER ########################
+
+echo "`date`: Removing MDM Profile before proceeding"
+# issue jamf command to remove MDM Profile
+# perhaps skip this if api provided?
+/usr/local/jamf/bin/jamf removemdmprofile
+
+#wait for profile to be removed
+secs=0
+# future change - maybe reduce time if api info provided
+jamf_wait="$JAMF_WAIT_MDMREMOVEPROFILE"
+echo "`date`: Waiting up to $jamf_wait seconds for MDM Profile to be removed"
+mdmEnrolled=$(profiles status -type enrollment | fgrep "MDM enrollment" | awk '{print $3}')
+while [ "$mdmEnrolled" == "Yes" ] && [ "$secs" -le "$jamf_wait" ]; do
+  /bin/echo -n "."
+  sleep 5
+  ((secs=secs + 5))
+  mdmEnrolled=$(profiles status -type enrollment | fgrep "MDM enrollment" | awk '{print $3}')
+done
+echo
+
+if [ "$mdmEnrolled" == "Yes" ]; then
+  echo "`date`: MDM Profile not removed in $secs seconds - trying API"
+  # if source server & api auth provided, try using it to remove MDM Profile
+  if [ "$srcJamfUrl" == "" ] || [ "$srcJamfApiAuth" == "" ]; then
+    echo "`date`: Migration failed - profile not removed via binary and no source api info was provided."
+    errorMessage
+    exit 1
+  fi
+
+  # already got api token and jamf_id earlier for inventory.plist
+  # check jamf_id to be sure
+  if [ "$jamf_id" == "" ]; then
+    echo "`date`: Migration failed - profile not removed via binary and api credentials invalid"
+    errorMessage
+    exit 1
+  fi
+  
+  # check number of pending mdm commands, flush if >0
+  pending_command_count=$(curl -s \
+      "${srcJamfUrl}/JSSResource/computerhistory/id/${jamf_id}/subset/Commands" -X GET \
+      --header "Authorization: Bearer $srcAuthToken" \
+      | xmllint --format - \
+      | $XPATH "/computer_history/commands/pending" - \
+      | grep "<name>" | wc -l | awk '{print $1}')
+  if [ "$pending_command_count" != "0" ]; then
+    echo "`date`: Warning: Computer $HOST has [$pending_command_count] pending mdm commands"
+    # clear pending commands before continuing
+    echo "`date`: Clearing pending commands for $HOST..."
+    commandflush=$(curl -s -X DELETE \
+        "${srcJamfUrl}/JSSResource/commandflush/computers/id/${jamf_id}/status/Pending" \
+        --header "Authorization: Bearer $srcAuthToken" )
+    echo $commandflush
+  else
+    echo "`date`: $HOST has $pending_command_count MDM commands pending, continuing"
+  fi
+
+  echo "`date`: Trying to remove MDM Profile via api..."
+  mdmRemove=$(curl -sk "${srcJamfUrl}/JSSResource/computercommands/command/UnmanageDevice/id/${jamf_id}" -X POST \
+   --header "Authorization: Bearer ${srcAuthToken}")
+
+  echo mdmRemove: $mdmRemove
+  deviceNotFound=$(echo "$mdmRemove" | grep "server has not found anything matching")
+  mdmAuthRequired=$(echo "$mdmRemove" | grep "The request requires user authentication")
+  if [ "$mdmAuthRequired" != "" ]; then
+    echo "`date`: Migration failed - profile not removed.  Check api permissions"
+    errorMessage
+    exit 1
+  fi
+  #wait for profile to be removed
+  secs=0
+  jamf_wait="$JAMF_WAIT_APIMDMREMOVE"
+  echo "`date`: Waiting up to $jamf_wait seconds for MDM Profile to be removed"
+  mdmEnrolled=$(profiles status -type enrollment | fgrep "MDM enrollment" | awk '{print $3}')
+  while [ "$mdmEnrolled" == "Yes" ] && [ "$secs" -le "$jamf_wait" ]; do
+    /bin/echo -n "."
+    sleep 5
+    ((secs=secs + 5))
+    mdmEnrolled=$(profiles status -type enrollment | fgrep "MDM enrollment" | awk '{print $3}')
+  done
+  echo
+  echo "Profiles status:"
+  profiles status -type enrollment
+  if [ "$mdmEnrolled" == "Yes" ]; then
+    echo "`date`: Migration failed - profile not removed by jamf or api".
+    errorMessage
+    exit 1
+  fi
+fi
+
+# check if System Preferences or System Settings is open, close it
+prefsPid=$(ps xau | egrep -e "(MacOS/System Settings|MacOS/System Preferences)" | fgrep $currentUser | awk '{print $2}')
+if [ "$prefsPid" != "" ]; then
+  kill -9 $prefsPid
+fi
+
+openStatus=$(open -F "x-apple.systempreferences:com.apple.preferences.configurationprofiles" /tmp/enrollmentProfile.mobileconfig 2>&1)
+if [ "$openStatus" == "" ];then
+  echo "`date`: Opened System Preferences with MDM Profile"
+else
+  echo "`date`: Error opening System Preferences"
+  echo $openStatus
+  errorMessage
+  exit 1
+fi
+
+# elevate user, if not already admin
+userIsAdmin=$(dseditgroup -o checkmember -m $currentUser admin | awk '{print $1}')
+if [ "$userIsAdmin" == "no" ]; then
+  echo "`date`: Making $currentUser admin"
+  /usr/sbin/dseditgroup -o edit -a $currentUser -t user admin
+else
+  echo "`date`: User $currentUser is already admin"
+fi
+
+
+# wait for preferences (commented out, not really needed)
+#prefsPid=$(ps xau | egrep -e "(MacOS/System Settings|MacOS/System Preferences)" | fgrep $currentUser | awk '{print $2}')
+#while [ "$prefsPid" == "" ]; do
+#  echo "`date`: Waiting for Preferences"
+#  sleep 2
+#  prefsPid=$(ps xau | egrep -e "(MacOS/System Settings|MacOS/System Preferences)" | fgrep $currentUser | awk '{print $2}')
+#done
+
+# FIX: settings as well as preferences
+launchctl asuser $uid osascript <<'END'
+tell application "System Preferences"
+     activate
+end tell
+END
+
+currentMDMServer=$(profiles status -type enrollment | fgrep "MDM server" | awk -F"/" '{print $3}')
+mdmEnrolled=$(profiles status -type enrollment | fgrep "MDM enrollment" | awk '{print $3}')
+
+jamf_wait="$JAMF_WAIT_MDMADD"
+retry_mdminstall="$JAMF_WAIT_RETRYMDMINSTALL"
+secs=0
+mdmsecs=0
+echo "`date`: Waiting up to $jamf_wait seconds for MDM Profile to be installed"
+mdmEnrolled=$(profiles status -type enrollment | fgrep "MDM enrollment" | awk '{print $3}')
+while [ "$mdmEnrolled" != "Yes" ] && [ "$secs" -le "$jamf_wait" ]; do
+  /bin/echo -n "."
+  if [ "$mdmsecs" == "$retry_mdminstall" ]; then
+    # retry install
+    echo
+    echo Retrying MDM install
+    # reopen in case user closed it
+    openStatus=$(open -F "x-apple.systempreferences:com.apple.preferences.configurationprofiles" /tmp/enrollmentProfile.mobileconfig 2>&1)
+    launchctl asuser $uid osascript <<'END'
+    tell application "System Preferences"
+       activate
+    end tell
+    display dialog "Please install the MDM Profile to finish the migration" buttons {"Continue"} default button "Continue" giving up after 20
+END
+    mdmsecs=0
+  fi
+  sleep 2
+  ((secs=secs + 2))
+  ((mdmsecs=mdmsecs + 2))
+  mdmEnrolled=$(profiles status -type enrollment | fgrep "MDM enrollment" | awk '{print $3}')
+
+done
+echo
+echo "`date`: MDM Profile install loop exited after $secs seconds"
+if [ "$userIsAdmin" == "no" ]; then
+  echo "`date`: Removing $currentUser admin rights"
+  /usr/sbin/dseditgroup -o edit -d $currentUser -t user admin
+fi
+
+mdmEnrolled=$(profiles status -type enrollment | fgrep "MDM enrollment" | awk '{print $3}')
+currentMDMServer=$(profiles status -type enrollment | fgrep "MDM server" | awk -F"/" '{print $3}')
+if [ "$currentMDMServer" == "$mdmServer" ] || [ "$mdmEnrolled" != "Yes" ]; then
+  echo "`date`: ERROR: Migration failed - current MDM Server: [$currentMDMServer]"
+  errorMessage
+  exit 1
+fi
+
+# check if System Preferences or System Settings is open, close it
+prefsPid=$(ps xau | egrep -e "(MacOS/System Settings|MacOS/System Preferences)" | fgrep $currentUser | awk '{print $2}')
+if [ "$prefsPid" != "" ]; then
+  kill -9 $prefsPid
+fi
+
+# Close Self Service if open
+echo "Checking if Self Service is running" >>$LOG
+selfservice_pid=$(ps xau | grep "Self Service" | grep -v root | awk '{print $2}')
+if [ "$selfservice_pid" != "" ]; then
+  echo "Closing Self Service pid $selfservice_pid" >>$LOG
+  kill -9 $selfservice_pid
+fi
+doneMessage="$DIALOG_TITLE
+
+Migration to $DIALOG_JAMF_DEST is complete!"
+doneTimeout=60
+osascript -e \
+'display dialog "'"$doneMessage"'\n" buttons {"Ok"} default button "Ok" giving up after '"$doneTimeout"'' 2>/dev/null
+
+echo "Migration complete"
+exit 0
